@@ -107,7 +107,7 @@ def send_slack(text, blocks=None):
         return False
 
 
-def format_slack_alert(user_id, level, anomalies):
+def format_slack_alert(user_id, level, anomalies, ctx=None):
     """Build a Slack Block Kit message for an anomaly alert."""
     flags = []
     for a in anomalies:
@@ -125,6 +125,20 @@ def format_slack_alert(user_id, level, anomalies):
 
     flag_text = "\n".join(flags)
 
+    # User context block
+    ctx_text = ""
+    if ctx:
+        blocked_str = ":no_entry: Blocked" if ctx["blocked"] else ":white_check_mark: Not Blocked"
+        ctx_text = (
+            f"\n\n"
+            f"*Total Games:* {ctx['total_games']:,}  |  "
+            f"*Avg/day:* {ctx['avg_games_per_day']}\n"
+            f"*Total Ads:* {ctx['total_ads']:,}  |  "
+            f"*Avg eCPM (last 10):* ${ctx['avg_ecpm']:.2f}\n"
+            f"*Ads Revenue:* ${ctx['ads_revenue']:.2f}  |  "
+            f"{blocked_str}"
+        )
+
     blocks = [
         {
             "type": "header",
@@ -137,7 +151,7 @@ def format_slack_alert(user_id, level, anomalies):
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"*User:* `{user_id}`\n*Level:* {level}\n\n{flag_text}",
+                "text": f"*User:* `{user_id}`\n*Level:* {level}\n\n{flag_text}{ctx_text}",
             },
         },
         {
@@ -151,8 +165,73 @@ def format_slack_alert(user_id, level, anomalies):
         },
     ]
 
-    plain = f"Bot Alert: User {user_id[:12]}... reached level {level}. {'; '.join(f['type'] for f in anomalies)}"
+    plain = f"Bot Alert: User {user_id[:12]}... reached level {level}. {'; '.join(a['type'] for a in anomalies)}"
     return plain, blocks
+
+
+# ─── USER CONTEXT ────────────────────────────────────────────────────────────
+
+def get_user_context(user_id):
+    """Fetch enriched user data for the Slack alert."""
+    # User profile
+    rows = query_db(
+        f"SELECT level, exp, gamesPlayed, date_created, "
+        f"numberOfInterstitialWatched, ads_usd_generated_total, "
+        f"blocked, softBlock "
+        f'FROM directus_users WHERE id = "{user_id}"'
+    )
+    if not rows:
+        return None
+
+    user = rows[0]
+
+    # Parse gamesPlayed JSON
+    gp = user.get("gamesPlayed")
+    if isinstance(gp, str):
+        try:
+            gp = json.loads(gp) if gp else []
+        except json.JSONDecodeError:
+            gp = []
+    elif gp is None:
+        gp = []
+    total_games = sum(g.get("numberOfGame", 0) for g in gp) if gp else 0
+
+    # Days since creation
+    created = user.get("date_created", "")
+    days = 1
+    if created:
+        try:
+            dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            days = max((datetime.now(timezone.utc) - dt).days, 1)
+        except (ValueError, TypeError):
+            pass
+
+    # Average eCPM on last 10 ads
+    ecpm_rows = query_db(
+        f"SELECT AVG(revenue) * 1000 as avg_ecpm FROM "
+        f"(SELECT revenue FROM AdsWatched WHERE user = \"{user_id}\" "
+        f"ORDER BY id DESC LIMIT 10) t"
+    )
+    avg_ecpm = 0
+    if ecpm_rows and ecpm_rows[0].get("avg_ecpm"):
+        try:
+            avg_ecpm = float(ecpm_rows[0]["avg_ecpm"])
+        except (TypeError, ValueError):
+            pass
+
+    blocked = user.get("blocked", 0) or 0
+    soft_block = user.get("softBlock", 0) or 0
+    is_blocked = int(blocked) > 0 or int(soft_block) > 0
+
+    return {
+        "total_games": total_games,
+        "avg_games_per_day": round(total_games / days, 1),
+        "total_ads": user.get("numberOfInterstitialWatched", 0) or 0,
+        "ads_revenue": float(user.get("ads_usd_generated_total", 0) or 0),
+        "avg_ecpm": round(avg_ecpm, 2),
+        "blocked": is_blocked,
+        "days_active": days,
+    }
 
 
 # ─── CHECKS ──────────────────────────────────────────────────────────────────
@@ -300,8 +379,11 @@ def poll_once(state):
                 f"flags={[a['type'] for a in anomalies]}"
             )
 
+            # Fetch user context for enriched alert
+            ctx = get_user_context(user_id)
+
             # Send Slack alert
-            plain, blocks = format_slack_alert(user_id, level, anomalies)
+            plain, blocks = format_slack_alert(user_id, level, anomalies, ctx)
             send_slack(plain, blocks)
 
             # Mark as flagged
