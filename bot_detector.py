@@ -245,20 +245,8 @@ def get_user_context(user_id):
 
 # ─── CHECKS ──────────────────────────────────────────────────────────────────
 
-def check_xp_coherence(user_id):
-    """Check 1: Does the user's XP make sense relative to games played?"""
-    rows = query_db(
-        f'SELECT level, exp, gamesPlayed FROM directus_users WHERE id = "{user_id}"'
-    )
-    if not rows:
-        return None
-
-    user = rows[0]
-    level = user.get("level", 0)
-    exp = user.get("exp", 0)
-
-    # Parse gamesPlayed JSON
-    gp = user.get("gamesPlayed")
+def parse_games_played(gp):
+    """Parse gamesPlayed JSON field into total game count."""
     if isinstance(gp, str):
         try:
             gp = json.loads(gp) if gp else []
@@ -266,11 +254,15 @@ def check_xp_coherence(user_id):
             gp = []
     elif gp is None:
         gp = []
+    return sum(g.get("numberOfGame", 0) for g in gp) if gp else 0
 
-    total_games = sum(g.get("numberOfGame", 0) for g in gp) if gp else 0
+
+def check_xp_coherence_inline(row):
+    """Check 1: XP coherence — runs in-memory from poll data, NO extra query."""
+    exp = row.get("exp", 0) or 0
+    total_games = parse_games_played(row.get("gamesPlayed"))
 
     if total_games == 0:
-        # No games but has XP > level 5 threshold = suspicious
         if exp > 1500:
             return {
                 "type": "xp_coherence",
@@ -293,28 +285,64 @@ def check_xp_coherence(user_id):
     return None
 
 
-def check_velocity(user_id, lvlup_time=None):
-    """Check 2: Did the user play >100 games in the 24 hours before the level-up?"""
-    if lvlup_time:
-        # Use the level-up timestamp as reference point
-        rows = query_db(
-            f"SELECT COUNT(*) as cnt FROM Scores "
-            f'WHERE user_id = "{user_id}" '
-            f'AND date_created BETWEEN DATE_SUB("{lvlup_time}", INTERVAL 24 HOUR) AND "{lvlup_time}"'
-        )
-    else:
-        rows = query_db(
-            f"SELECT COUNT(*) as cnt FROM Scores "
-            f'WHERE user_id = "{user_id}" '
-            f"AND date_created >= NOW() - INTERVAL 24 HOUR"
-        )
-    if not rows:
-        return None
+def check_velocity_batch(items):
+    """Check 2: Velocity — ONE batched query for all users instead of N queries."""
+    if not items:
+        return {}
 
-    games_24h = rows[0].get("cnt", 0)
-    if games_24h > VELOCITY_THRESHOLD:
-        return {"type": "velocity", "games_24h": games_24h}
-    return None
+    # Find the earliest lvlup_time to set the window
+    # We query games per user in the 24h before their respective level-up
+    # Strategy: one query with all user_ids, broad 48h window, then filter in Python
+    user_ids = [item["user_id"] for item in items]
+    quoted_ids = ", ".join(f'"{uid}"' for uid in user_ids)
+
+    # Use a broad window (last 48h from now) to capture all relevant scores
+    rows = query_db(
+        f"SELECT user_id, date_created FROM Scores "
+        f"WHERE user_id IN ({quoted_ids}) "
+        f"AND date_created >= NOW() - INTERVAL 48 HOUR"
+    )
+
+    if not rows:
+        return {}
+
+    # Build a lookup: user_id -> lvlup_time
+    lvlup_times = {}
+    for item in items:
+        uid = item["user_id"]
+        lt = item.get("lvlup_time", "")
+        if lt:
+            try:
+                lvlup_times[uid] = datetime.fromisoformat(lt.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                lvlup_times[uid] = datetime.now(timezone.utc)
+        else:
+            lvlup_times[uid] = datetime.now(timezone.utc)
+
+    # Count games in the 24h window before each user's level-up
+    from collections import defaultdict
+    counts = defaultdict(int)
+    for score in rows:
+        uid = score.get("user_id")
+        if uid not in lvlup_times:
+            continue
+        score_time_str = score.get("date_created", "")
+        try:
+            score_time = datetime.fromisoformat(score_time_str.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            continue
+        lvl_time = lvlup_times[uid]
+        from datetime import timedelta
+        if lvl_time - timedelta(hours=24) <= score_time <= lvl_time:
+            counts[uid] += 1
+
+    # Build results
+    results = {}
+    for uid, cnt in counts.items():
+        if cnt > VELOCITY_THRESHOLD:
+            results[uid] = {"type": "velocity", "games_24h": cnt}
+
+    return results
 
 
 # ─── MAIN LOOP ───────────────────────────────────────────────────────────────
@@ -336,9 +364,10 @@ def poll_once(state):
     """Check for new level-ups since last_id and analyze them."""
     last_id = state["last_id"]
 
-    # Fetch new level-up events (gems currency = 1 per actual level-up)
+    # Fetch new level-up events WITH user data (XP coherence in-memory, no extra query)
     rows = query_db(
-        f"SELECT h.id, h.user_id, h.date_created, u.level "
+        f"SELECT h.id, h.user_id, h.date_created, "
+        f"u.level, u.exp, u.gamesPlayed "
         f"FROM Balance_History h "
         f"JOIN directus_users u ON h.user_id = u.id "
         f'WHERE h.type = "icon_level" AND h.currency = "gems" '
@@ -354,53 +383,59 @@ def poll_once(state):
 
     log.info(f"Processing {len(rows)} new level-up events")
 
+    # Filter to users we haven't flagged yet and collect for batch processing
+    to_check = []
     for row in rows:
-        user_id = row.get("user_id")
         event_id = row.get("id", 0)
-        level = row.get("level", 0)
-        lvlup_time = row.get("date_created")
-
-        # Update last_id
         if event_id > state["last_id"]:
             state["last_id"] = event_id
 
-        if not user_id:
+        user_id = row.get("user_id")
+        if not user_id or user_id in state["flagged_users"]:
             continue
 
-        # Skip already flagged users
-        if user_id in state["flagged_users"]:
-            continue
-
-        # Run checks
+        # XP coherence check — done in-memory, no extra query
         anomalies = []
-
-        xp_result = check_xp_coherence(user_id)
+        xp_result = check_xp_coherence_inline(row)
         if xp_result:
             anomalies.append(xp_result)
 
-        vel_result = check_velocity(user_id, lvlup_time)
-        if vel_result:
-            anomalies.append(vel_result)
+        to_check.append({
+            "user_id": user_id,
+            "level": row.get("level", 0),
+            "lvlup_time": row.get("date_created"),
+            "anomalies": anomalies,
+        })
 
-        if anomalies:
-            log.warning(
-                f"ANOMALY: user={user_id[:12]}... level={level} "
-                f"flags={[a['type'] for a in anomalies]}"
-            )
+    # Batch velocity check — ONE query for all users instead of N individual queries
+    if to_check:
+        velocity_results = check_velocity_batch(to_check)
 
-            # Fetch user context for enriched alert
-            ctx = get_user_context(user_id)
+        for item in to_check:
+            user_id = item["user_id"]
+            vel = velocity_results.get(user_id)
+            if vel:
+                item["anomalies"].append(vel)
 
-            # Send Slack alert
-            plain, blocks = format_slack_alert(user_id, level, anomalies, ctx)
-            send_slack(plain, blocks)
+            if item["anomalies"]:
+                log.warning(
+                    f"ANOMALY: user={user_id[:12]}... level={item['level']} "
+                    f"flags={[a['type'] for a in item['anomalies']]}"
+                )
 
-            # Mark as flagged
-            state["flagged_users"][user_id] = {
-                "first_detected": datetime.now(timezone.utc).isoformat(),
-                "level_at_detection": level,
-                "anomalies": [a["type"] for a in anomalies],
-            }
+                # Fetch user context only for flagged users
+                ctx = get_user_context(user_id)
+
+                # Send Slack alert
+                plain, blocks = format_slack_alert(user_id, item["level"], item["anomalies"], ctx)
+                send_slack(plain, blocks)
+
+                # Mark as flagged
+                state["flagged_users"][user_id] = {
+                    "first_detected": datetime.now(timezone.utc).isoformat(),
+                    "level_at_detection": item["level"],
+                    "anomalies": [a["type"] for a in item["anomalies"]],
+                }
 
     save_state(state)
 
