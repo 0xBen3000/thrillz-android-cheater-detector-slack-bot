@@ -176,7 +176,7 @@ def get_user_context(user_id):
     # User profile
     rows = query_db(
         f"SELECT level, exp, gamesPlayed, date_created, "
-        f"first_name, last_name, email, "
+        f"pseudo, email, "
         f"numberOfInterstitialWatched, ads_usd_generated_total, "
         f"blocked, softBlock "
         f'FROM directus_users WHERE id = "{user_id}"'
@@ -224,9 +224,7 @@ def get_user_context(user_id):
     soft_block = user.get("softBlock", 0) or 0
     is_blocked = int(blocked) > 0 or int(soft_block) > 0
 
-    first = user.get("first_name") or ""
-    last = user.get("last_name") or ""
-    name = f"{first} {last}".strip() or user.get("email") or "Unknown"
+    name = user.get("pseudo") or user.get("email") or "Unknown"
 
     return {
         "name": name,
