@@ -51,7 +51,17 @@ def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
             return json.load(f)
-    return {"last_id": 0, "flagged_users": {}}
+    # First run: start from current MAX(id) — only monitor NEW level-ups
+    log.info("No state file found. Querying current MAX(id) to start fresh...")
+    rows = query_db(
+        "SELECT MAX(id) as max_id FROM Balance_History "
+        "WHERE type = 'icon_level'"
+    )
+    max_id = 0
+    if rows and rows[0].get("max_id"):
+        max_id = int(rows[0]["max_id"])
+        log.info(f"Starting from Balance_History id={max_id} (only new events)")
+    return {"last_id": max_id, "flagged_users": {}}
 
 
 def save_state(state):
@@ -383,8 +393,8 @@ def poll_once(state):
 
     log.info(f"Processing {len(rows)} new level-up events")
 
-    # Filter to users we haven't flagged yet and collect for batch processing
-    to_check = []
+    # Filter to users we haven't flagged yet — DEDUPLICATE within the batch
+    to_check = {}  # user_id -> item (keep latest event per user)
     for row in rows:
         event_id = row.get("id", 0)
         if event_id > state["last_id"]:
@@ -393,6 +403,8 @@ def poll_once(state):
         user_id = row.get("user_id")
         if not user_id or user_id in state["flagged_users"]:
             continue
+        if user_id in to_check:
+            continue  # already queued in this batch
 
         # XP coherence check — done in-memory, no extra query
         anomalies = []
@@ -400,12 +412,13 @@ def poll_once(state):
         if xp_result:
             anomalies.append(xp_result)
 
-        to_check.append({
+        to_check[user_id] = {
             "user_id": user_id,
             "level": row.get("level", 0),
             "lvlup_time": row.get("date_created"),
             "anomalies": anomalies,
-        })
+        }
+    to_check = list(to_check.values())
 
     # Batch velocity check — ONE query for all users instead of N individual queries
     if to_check:
