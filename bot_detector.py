@@ -136,6 +136,8 @@ def format_slack_alert(user_id, level, anomalies, ctx=None):
             f"*Total Ads:* {ctx['total_ads']:,}  |  "
             f"*Avg eCPM (last 10):* ${ctx['avg_ecpm']:.2f}\n"
             f"*Ads Revenue:* ${ctx['ads_revenue']:.2f}  |  "
+            f"*Gems:* {ctx['gems']:,}\n"
+            f"*Total Withdrawn:* ${ctx['total_withdrawn']:.2f}  |  "
             f"{blocked_str}"
         )
 
@@ -178,6 +180,7 @@ def get_user_context(user_id):
         f"SELECT level, exp, gamesPlayed, date_created, "
         f"pseudo, email, "
         f"numberOfInterstitialWatched, ads_usd_generated_total, "
+        f"gems, totalWithdrawAmount, "
         f"blocked, softBlock "
         f'FROM directus_users WHERE id = "{user_id}"'
     )
@@ -233,6 +236,8 @@ def get_user_context(user_id):
         "total_ads": user.get("numberOfInterstitialWatched", 0) or 0,
         "ads_revenue": float(user.get("ads_usd_generated_total", 0) or 0),
         "avg_ecpm": round(avg_ecpm, 2),
+        "gems": int(user.get("gems", 0) or 0),
+        "total_withdrawn": float(user.get("totalWithdrawAmount", 0) or 0),
         "blocked": is_blocked,
         "days_active": days,
     }
