@@ -7,13 +7,15 @@ Sends Slack alerts on first detection.
 
 import json
 import os
+import re
 import sys
 import time
 import signal
 import logging
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
@@ -23,12 +25,15 @@ DATABASE = "thrillz-dev-android"
 
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 SLACK_CHANNEL = "#android-anomalies"
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
+SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "C0AP6EG682D")  # #android-anomalies
 
 POLL_INTERVAL = 30          # seconds between polls
 MIN_LEVEL = 5               # only check level-ups above this
 VELOCITY_THRESHOLD = 100    # games in 24h to flag
 XP_RATIO_THRESHOLD = 3.0    # xp_per_game / 100 — flag if above this
 NORMAL_XP_PER_GAME = 100    # baseline XP per game
+BACKFILL_DAYS = 7           # days of history to backfill on fresh start
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_detector.log")
@@ -47,21 +52,158 @@ log = logging.getLogger("bot_detector")
 
 # ─── STATE ───────────────────────────────────────────────────────────────────
 
+def rebuild_flagged_from_slack():
+    """Read recent Slack messages to rebuild flagged_users set (survives redeploys)."""
+    if not SLACK_BOT_TOKEN:
+        log.info("No SLACK_BOT_TOKEN set — cannot rebuild from Slack, using backfill instead")
+        return {}
+
+    flagged = {}
+    cursor = None
+    try:
+        while True:
+            url = (
+                f"https://slack.com/api/conversations.history"
+                f"?channel={SLACK_CHANNEL_ID}&limit=200"
+            )
+            if cursor:
+                url += f"&cursor={cursor}"
+
+            req = urllib.request.Request(
+                url,
+                headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+
+            if not data.get("ok"):
+                log.warning(f"Slack API error: {data.get('error')}")
+                break
+
+            for msg in data.get("messages", []):
+                text = msg.get("text", "")
+                # Extract user IDs from alert messages (format: *User:* `uuid`)
+                if "Bot Alert" in text or "bot_alert" in text.lower():
+                    match = re.search(r'`([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})`', text)
+                    if match:
+                        uid = match.group(1)
+                        if uid not in flagged:
+                            flagged[uid] = {
+                                "first_detected": "rebuilt_from_slack",
+                                "level_at_detection": 0,
+                                "anomalies": ["rebuilt"],
+                            }
+
+            # Paginate
+            if data.get("has_more") and data.get("response_metadata", {}).get("next_cursor"):
+                cursor = data["response_metadata"]["next_cursor"]
+            else:
+                break
+
+    except Exception as e:
+        log.warning(f"Failed to rebuild from Slack: {e}")
+
+    log.info(f"Rebuilt {len(flagged)} flagged users from Slack history")
+    return flagged
+
+
+def backfill_flagged_silent():
+    """Dry-run recent level-ups to populate flagged_users without sending Slack alerts."""
+    log.info(f"Backfilling last {BACKFILL_DAYS} days of level-ups (silent mode)...")
+    flagged = {}
+
+    rows = query_db(
+        f"SELECT h.id, h.user_id, h.date_created, "
+        f"u.level, u.exp, u.gamesPlayed "
+        f"FROM Balance_History h "
+        f"JOIN directus_users u ON h.user_id = u.id "
+        f'WHERE h.type = "icon_level" AND h.currency = "gems" '
+        f"AND h.date_created >= NOW() - INTERVAL {BACKFILL_DAYS} DAY "
+        f"AND u.level > {MIN_LEVEL} "
+        f"ORDER BY h.id ASC LIMIT 500"
+    )
+
+    if not rows:
+        log.info("No recent level-ups to backfill")
+        return flagged, 0
+
+    max_id = 0
+    seen_users = {}
+    for row in rows:
+        event_id = row.get("id", 0)
+        if event_id > max_id:
+            max_id = event_id
+
+        uid = row.get("user_id")
+        if not uid or uid in seen_users:
+            continue
+
+        # XP coherence check
+        xp_result = check_xp_coherence_inline(row)
+        if xp_result:
+            seen_users[uid] = True
+            flagged[uid] = {
+                "first_detected": "backfill_silent",
+                "level_at_detection": row.get("level", 0),
+                "anomalies": ["xp_coherence"],
+            }
+
+    # Batch velocity check on unique users
+    to_check = []
+    for row in rows:
+        uid = row.get("user_id")
+        if uid and uid not in flagged and uid not in [i["user_id"] for i in to_check]:
+            to_check.append({
+                "user_id": uid,
+                "level": row.get("level", 0),
+                "lvlup_time": row.get("date_created"),
+                "anomalies": [],
+            })
+
+    if to_check:
+        vel_results = check_velocity_batch(to_check)
+        for uid, vel in vel_results.items():
+            flagged[uid] = {
+                "first_detected": "backfill_silent",
+                "level_at_detection": 0,
+                "anomalies": ["velocity"],
+            }
+
+    log.info(f"Backfill: {len(flagged)} users would have been flagged (silent, no Slack)")
+    return flagged, max_id
+
+
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    # First run: start from current MAX(id) — only monitor NEW level-ups
-    log.info("No state file found. Querying current MAX(id) to start fresh...")
-    rows = query_db(
-        "SELECT MAX(id) as max_id FROM Balance_History "
-        "WHERE type = 'icon_level'"
-    )
-    max_id = 0
-    if rows and rows[0].get("max_id"):
-        max_id = int(rows[0]["max_id"])
-        log.info(f"Starting from Balance_History id={max_id} (only new events)")
-    return {"last_id": max_id, "flagged_users": {}}
+            state = json.load(f)
+            log.info(f"Loaded state: last_id={state['last_id']}, {len(state.get('flagged_users', {}))} flagged")
+            return state
+
+    log.info("No state file — rebuilding flagged_users...")
+
+    # Strategy 1: Try to rebuild from Slack messages (best — real source of truth)
+    flagged = rebuild_flagged_from_slack()
+
+    # Strategy 2: Backfill from DB (silent dry-run)
+    backfill_flagged, max_id = backfill_flagged_silent()
+
+    # Merge both sources
+    for uid, info in backfill_flagged.items():
+        if uid not in flagged:
+            flagged[uid] = info
+
+    # Start from current max_id so we don't reprocess
+    if not max_id:
+        max_rows = query_db(
+            "SELECT MAX(id) as max_id FROM Balance_History "
+            "WHERE type = 'icon_level'"
+        )
+        if max_rows and max_rows[0].get("max_id"):
+            max_id = int(max_rows[0]["max_id"])
+
+    log.info(f"Starting fresh: last_id={max_id}, {len(flagged)} users pre-flagged")
+    return {"last_id": max_id, "flagged_users": flagged}
 
 
 def save_state(state):
@@ -330,7 +472,6 @@ def check_velocity_batch(items):
             lvlup_times[uid] = datetime.now(timezone.utc)
 
     # Count games in the 24h window before each user's level-up
-    from collections import defaultdict
     counts = defaultdict(int)
     for score in rows:
         uid = score.get("user_id")
@@ -342,7 +483,6 @@ def check_velocity_batch(items):
         except (ValueError, TypeError):
             continue
         lvl_time = lvlup_times[uid]
-        from datetime import timedelta
         if lvl_time - timedelta(hours=24) <= score_time <= lvl_time:
             counts[uid] += 1
 
@@ -436,12 +576,20 @@ def poll_once(state):
                     f"flags={[a['type'] for a in item['anomalies']]}"
                 )
 
-                # Fetch user context only for flagged users
+                # Fetch user context — retry once on failure
                 ctx = get_user_context(user_id)
+                if ctx is None:
+                    log.warning(f"Context fetch failed for {user_id[:12]}..., retrying...")
+                    time.sleep(2)
+                    ctx = get_user_context(user_id)
+                if ctx is None:
+                    log.error(f"Context fetch failed twice for {user_id[:12]}..., sending without context")
 
                 # Send Slack alert
                 plain, blocks = format_slack_alert(user_id, item["level"], item["anomalies"], ctx)
-                send_slack(plain, blocks)
+                if not send_slack(plain, blocks):
+                    log.error(f"Slack send failed for {user_id[:12]}..., will NOT mark as flagged")
+                    continue  # Don't mark as flagged — retry next cycle
 
                 # Mark as flagged
                 state["flagged_users"][user_id] = {
