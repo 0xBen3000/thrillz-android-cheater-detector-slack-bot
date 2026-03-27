@@ -236,27 +236,100 @@ def query_db(sql):
 # ─── SLACK ───────────────────────────────────────────────────────────────────
 
 def send_slack(text, blocks=None):
-    if not SLACK_WEBHOOK_URL:
-        log.warning(f"No SLACK_WEBHOOK_URL set. Message: {text}")
+    """Send alert via chat.postMessage (preferred) or webhook fallback.
+    Returns True on success. Adds workflow emoji reactions automatically."""
+
+    ts = None  # message timestamp for reactions
+
+    # Strategy 1: Use Bot Token + chat.postMessage (returns ts for reactions)
+    if SLACK_BOT_TOKEN:
+        payload = {
+            "channel": SLACK_CHANNEL_ID,
+            "text": text,
+        }
+        if blocks:
+            payload["blocks"] = blocks
+
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            "https://slack.com/api/chat.postMessage",
+            data=data,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+                if result.get("ok"):
+                    ts = result.get("ts")
+                    log.info(f"Slack message sent via API (ts={ts})")
+                else:
+                    log.error(f"Slack API error: {result.get('error')}")
+                    # Fall through to webhook
+        except Exception as e:
+            log.error(f"Slack API send failed: {e}")
+            # Fall through to webhook
+
+    # Strategy 2: Webhook fallback (no ts, no reactions)
+    if not ts and SLACK_WEBHOOK_URL:
+        payload = {"text": text, "channel": SLACK_CHANNEL}
+        if blocks:
+            payload["blocks"] = blocks
+
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            SLACK_WEBHOOK_URL,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status == 200:
+                    log.info("Slack message sent via webhook (no reactions possible)")
+                    return True
+        except Exception as e:
+            log.error(f"Slack webhook send failed: {e}")
+            return False
+
+    if not ts and not SLACK_WEBHOOK_URL:
+        log.warning(f"No Slack credentials set. Message: {text}")
         return False
 
-    payload = {"text": text, "channel": SLACK_CHANNEL}
-    if blocks:
-        payload["blocks"] = blocks
+    # Add workflow emoji reactions: ❌ ‼️ ⛔
+    if ts and SLACK_BOT_TOKEN:
+        for emoji in ["x", "bangbang", "no_entry"]:
+            add_reaction(ts, emoji)
 
-    data = json.dumps(payload).encode("utf-8")
+    return True
+
+
+def add_reaction(ts, emoji):
+    """Add an emoji reaction to a Slack message."""
+    payload = json.dumps({
+        "channel": SLACK_CHANNEL_ID,
+        "timestamp": ts,
+        "name": emoji,
+    }).encode("utf-8")
     req = urllib.request.Request(
-        SLACK_WEBHOOK_URL,
-        data=data,
-        headers={"Content-Type": "application/json"},
+        "https://slack.com/api/reactions.add",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+        },
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status == 200
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            if not result.get("ok"):
+                log.warning(f"Failed to add :{emoji}: reaction: {result.get('error')}")
     except Exception as e:
-        log.error(f"Slack send failed: {e}")
-        return False
+        log.warning(f"Failed to add :{emoji}: reaction: {e}")
 
 
 def format_slack_alert(user_id, level, anomalies, ctx=None):
@@ -319,7 +392,7 @@ def format_slack_alert(user_id, level, anomalies, ctx=None):
         },
     ]
 
-    plain = f"Bot Alert: User {user_id[:12]}... reached level {level}. {'; '.join(a['type'] for a in anomalies)}"
+    plain = f"Bot Alert: User `{user_id}` reached level {level}. {'; '.join(a['type'] for a in anomalies)}"
     return plain, blocks
 
 
